@@ -13,20 +13,17 @@ from tkinter import Tk, filedialog
 
 try:
     from config import SERVICE_BOT_TOKEN
-    # We rename the import to avoid confusion with the function name
+    # The import names now match the uploader file we created.
     from uploader_bot import perform_upload as uploader_function
+    from downloader import perform_download as downloader_function
 except ImportError as e:
     print("---FATAL ERROR---")
     print(f"Could not import necessary modules: {e}")
-    print("Please ensure 'config.py' and 'uploader_bot.py' are in the same directory as this script.")
+    print("Please ensure 'config.py', 'uploader_bot.py', and 'downloader.py' are in the same directory.")
     sys.exit(1)
 
-# --- NEW: Centralized Data Directory ---
-# Both the bot and client will now use a shared folder in the user's home directory.
-# This is a much more robust solution than using relative paths.
+# --- Configuration ---
 DATA_DIR = os.path.join(os.path.expanduser("~"), ".telegram_cloud_service")
-os.makedirs(DATA_DIR, exist_ok=True) # Ensure the directory exists
-
 CLIENT_ID_FILE = os.path.join(DATA_DIR, "client_id.txt")
 USER_DB_PATH = os.path.join(DATA_DIR, 'user_database.json')
 TASK_QUEUE_PATH = os.path.join(DATA_DIR, 'task_queue.json')
@@ -47,13 +44,10 @@ def get_client_id():
 
 def load_json(path):
     """Safely loads a JSON file."""
-    if not os.path.exists(path):
-        return {}
+    if not os.path.exists(path): return {}
     with open(path, 'r', encoding='utf-8') as f:
-        try:
-            return json.load(f)
-        except (json.JSONDecodeError, FileNotFoundError):
-            return {}
+        try: return json.load(f)
+        except: return {}
 
 def save_json(data, path):
     """Saves data to a JSON file."""
@@ -84,22 +78,16 @@ def main():
         service_bot = telebot.TeleBot(SERVICE_BOT_TOKEN)
         service_bot.get_me()
         print("Successfully connected to the main service bot.")
-
     except Exception as e:
         print(f"\n---FATAL CONNECTION ERROR---: {e}")
         return
     
-    # --- Registration Loop ---
+    # Registration Loop
     my_user_id = None
     print("Waiting for registration...")
-    print("Please complete the setup process with the bot on Telegram using the Client ID above.")
     while not my_user_id:
         try:
-            # --- THIS IS THE FIX ---
-            # Added a debug print statement to see exactly what the client is reading.
-            print(f"[DEBUG] Checking for database at: {USER_DB_PATH}")
             user_db = load_json(USER_DB_PATH)
-            
             for uid, data in user_db.items():
                 if data.get("client_id") == client_id:
                     my_user_id = uid
@@ -113,36 +101,55 @@ def main():
     print("\n✅ Successfully Linked to Telegram User!")
     print("Waiting for commands... Keep this window open.")
 
-    # The main polling loop
+    # Main polling loop
     while True:
         try:
+            user_db = load_json(USER_DB_PATH) # Reload user_db in the loop to get fresh credentials
             tasks_db = load_json(TASK_QUEUE_PATH)
             my_task = tasks_db.get(my_user_id)
 
-            if my_task and my_task.get("status") == "pending" and my_task.get("task") == "upload":
-                print("\nReceived 'upload' command from bot.")
-                
+            if my_task and my_task.get("status") == "pending":
+                # Mark task as processing immediately
                 my_task["status"] = "processing"
                 save_json(tasks_db, TASK_QUEUE_PATH)
-
-                # We need to re-load the user_db here to get the latest credentials
-                user_db = load_json(USER_DB_PATH) 
+                
                 user_credentials = user_db.get(my_user_id, {})
                 user_bot_token = user_credentials.get("bot_token")
-                user_channel_id = user_credentials.get("channel_id")
 
-                if not user_bot_token or not user_channel_id:
-                    print("Error: Missing user's bot token or channel ID in the database.")
-                    service_bot.send_message(my_user_id, "❌ Upload failed: Your configuration is incomplete. Please /reset and start again.")
-                else:
-                    selected_file = open_file_dialog()
-                    if selected_file:
-                        print(f"User selected file: {selected_file}")
-                        uploader_function(user_bot_token, user_channel_id, selected_file, service_bot, my_user_id)
-                    else:
-                        print("User cancelled file selection.")
-                        service_bot.send_message(my_user_id, "Upload cancelled because no file was selected.")
+                if not user_bot_token:
+                    service_bot.send_message(my_user_id, "❌ Task failed: Could not find your bot token.")
                 
+                # --- Handle Upload Task ---
+                elif my_task.get("task") == "upload":
+                    print("\nReceived 'upload' command from bot.")
+                    user_channel_id = user_credentials.get("channel_id")
+                    if not user_channel_id:
+                        service_bot.send_message(my_user_id, "❌ Upload failed: Your configuration is incomplete.")
+                    else:
+                        selected_file = open_file_dialog()
+                        if selected_file:
+                            uploader_function(user_bot_token, user_channel_id, selected_file, service_bot, my_user_id)
+                        else:
+                            service_bot.send_message(my_user_id, "Upload cancelled because no file was selected.")
+                
+                # --- Handle Download Task ---
+                elif my_task.get("task") == "download":
+                    print("\nReceived 'download' command from bot.")
+                    filename_to_download = my_task.get("filename")
+                    
+                    user_files_db_path = os.path.join(DATA_DIR, f"user_{my_user_id}_files.json")
+                    user_files_db = load_json(user_files_db_path)
+                    file_info = user_files_db.get(filename_to_download)
+                    
+                    if not file_info:
+                        service_bot.send_message(my_user_id, f"❌ Download failed: Could not find data for '{filename_to_download}'.")
+                    else:
+                        # --- THIS IS THE FIX ---
+                        # Add the filename to the dictionary before passing it to the downloader.
+                        file_info['name'] = filename_to_download
+                        downloader_function(user_bot_token, file_info)
+
+                # Remove the completed/processed task
                 tasks_db.pop(my_user_id, None)
                 save_json(tasks_db, TASK_QUEUE_PATH)
                 print("\nTask complete. Waiting for next command...")

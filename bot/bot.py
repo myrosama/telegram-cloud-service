@@ -8,10 +8,9 @@ import shutil
 
 from config import BOT_TOKEN
 
-# --- NEW: Centralized Data Directory ---
-# Both the bot and client will now use a shared folder in the user's home directory.
+# --- Centralized Data Directory ---
 DATA_DIR = os.path.join(os.path.expanduser("~"), ".telegram_cloud_service")
-os.makedirs(DATA_DIR, exist_ok=True) # Ensure the directory exists
+os.makedirs(DATA_DIR, exist_ok=True) 
 
 USER_DB_PATH = os.path.join(DATA_DIR, "user_database.json")
 TASK_QUEUE_PATH = os.path.join(DATA_DIR, "task_queue.json")
@@ -21,24 +20,15 @@ user_states = {}
 
 # --- Database Helper Functions ---
 def load_json_db(path):
-    """Safely loads a JSON file."""
-    if not os.path.exists(path):
-        return {}
+    if not os.path.exists(path): return {}
     with open(path, 'r', encoding='utf-8') as f:
-        try:
-            return json.load(f)
-        except (json.JSONDecodeError, FileNotFoundError):
-            return {}
+        try: return json.load(f)
+        except: return {}
 
 def save_json_db(data, path):
-    """
-    Atomically saves data to a JSON file by writing to a temporary file
-    and then renaming it. This prevents read/write race conditions.
-    """
     temp_path = path + ".tmp"
     with open(temp_path, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=4)
-    # The rename operation is atomic on most operating systems
     shutil.move(temp_path, path)
 
 # --- Bot Initialization ---
@@ -49,9 +39,7 @@ print(f"Data directory is: {DATA_DIR}")
 # --- Command Handlers ---
 @bot.message_handler(commands=['reset'])
 def handle_reset(message):
-    """Allows a user to completely reset their data and start over."""
     user_id = str(message.chat.id)
-    
     user_states.pop(user_id, None)
     
     user_db = load_json_db(USER_DB_PATH)
@@ -59,7 +47,11 @@ def handle_reset(message):
     if user_data_existed:
         user_db.pop(user_id, None)
         save_json_db(user_db, USER_DB_PATH)
-    
+        # Also delete the user's specific file database
+        user_files_db_path = os.path.join(DATA_DIR, f"user_{user_id}_files.json")
+        if os.path.exists(user_files_db_path):
+            os.remove(user_files_db_path)
+
     task_db = load_json_db(TASK_QUEUE_PATH)
     if user_id in task_db:
         task_db.pop(user_id, None)
@@ -68,36 +60,42 @@ def handle_reset(message):
     reset_message = (
         "Your data has been completely reset on the server.\n\n"
         "**IMPORTANT NEXT STEP:**\n"
-        "The client app saves its ID in a file. To fully reset, you must find and delete this file at the following location on your computer:\n"
+        "To ensure a clean re-sync, please find and delete the client ID file at:\n"
         f"`{os.path.join(DATA_DIR, 'client_id.txt')}`\n\n"
-        "After you have deleted that file, send /start to begin the setup process again."
+        "After you have deleted that file, send /start to begin again."
     )
-    if user_data_existed:
-        bot.send_message(user_id, reset_message, parse_mode="Markdown")
-    else:
-        bot.send_message(user_id, "You have no data to reset. Please send /start to begin the setup process.")
-
+    bot.send_message(user_id, reset_message, parse_mode="Markdown")
 
 @bot.message_handler(commands=['start'])
 def handle_start(message):
     user_id = str(message.chat.id)
     user_db = load_json_db(USER_DB_PATH)
-
     welcome_text = (
         "👋 **Welcome to Telegram Cloud Service!**\n\n"
         "This bot will help you turn your own Telegram account into a secure, private, and unlimited cloud storage system.\n\n"
         "Let's get you set up."
     )
     bot.send_message(user_id, welcome_text, parse_mode="Markdown")
-
     if user_id in user_db and "client_id" in user_db[user_id]:
-        bot.send_message(user_id, "It looks like you're already set up! You can now use commands like `/upload` or `/files`. If you want to start over, send /reset.")
+        bot.send_message(user_id, "It looks like you're already set up! Use `/files` or `/upload`. To start over, send /reset.")
     else:
         setup_step1_ask_for_bot(message)
 
-
 @bot.message_handler(commands=['upload'])
 def handle_upload_command(message):
+    user_id = str(message.chat.id)
+    user_db = load_json_db(USER_DB_PATH)
+    if user_id not in user_db or "client_id" not in user_db[user_id]:
+        bot.send_message(user_id, "You need to complete the setup process first. Please send /start to begin.")
+        return
+    tasks_db = load_json_db(TASK_QUEUE_PATH)
+    tasks_db[user_id] = {"task": "upload", "status": "pending"}
+    save_json_db(tasks_db, TASK_QUEUE_PATH)
+    bot.send_message(user_id, "OK, I've sent a command to your desktop app. Please use the file window that appears on your computer to select the file you want to upload.")
+
+# --- NEW: /files command handler ---
+@bot.message_handler(commands=['files'])
+def handle_files_command(message):
     user_id = str(message.chat.id)
     user_db = load_json_db(USER_DB_PATH)
 
@@ -105,13 +103,44 @@ def handle_upload_command(message):
         bot.send_message(user_id, "You need to complete the setup process first. Please send /start to begin.")
         return
 
+    user_files_db_path = os.path.join(DATA_DIR, f"user_{user_id}_files.json")
+    user_files_db = load_json_db(user_files_db_path)
+
+    if not user_files_db:
+        bot.send_message(user_id, "You haven't uploaded any files yet.")
+        return
+
+    markup = types.InlineKeyboardMarkup()
+    for filename, data in user_files_db.items():
+        size_mb = data['file_size_bytes'] / (1024*1024)
+        button_text = f"{filename} ({size_mb:.2f} MB)"
+        # The callback data must be unique and contain info about the action and the file
+        callback_data = f"download::{filename}"
+        markup.add(types.InlineKeyboardButton(button_text, callback_data=callback_data))
+    
+    bot.send_message(user_id, "Here are your uploaded files. Click one to download:", reply_markup=markup)
+
+# --- NEW: Callback handler for the download buttons ---
+@bot.callback_query_handler(func=lambda call: call.data.startswith("download::"))
+def handle_download_callback(call):
+    user_id = str(call.message.chat.id)
+    filename = call.data.split("::")[1]
+
+    bot.answer_callback_query(call.id, f"Requesting download for {filename}...")
+    
+    # Create a download task for the client
     tasks_db = load_json_db(TASK_QUEUE_PATH)
-    tasks_db[user_id] = {"task": "upload", "status": "pending"}
+    tasks_db[user_id] = {
+        "task": "download",
+        "filename": filename,
+        "status": "pending"
+    }
     save_json_db(tasks_db, TASK_QUEUE_PATH)
     
-    bot.send_message(user_id, "OK, I've sent a command to your desktop app. Please use the file window that appears on your computer to select the file you want to upload.")
+    bot.send_message(user_id, f"OK, I've sent the download command for '{filename}' to your desktop app.")
 
-# ... (rest of the setup functions remain the same) ...
+
+# --- (Setup functions remain the same) ---
 def setup_step1_ask_for_bot(message):
     user_id = str(message.chat.id)
     text = (
@@ -207,7 +236,7 @@ def setup_complete(message):
     user_id = str(message.chat.id)
     text = (
         "🎉 **Setup Complete!** 🎉\n\n"
-        "You are all set. You can now use `/upload`."
+        "You are all set. You can now use `/upload` and `/files`."
     )
     bot.send_message(user_id, text, parse_mode="Markdown")
     user_states.pop(user_id, None)
