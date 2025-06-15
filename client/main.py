@@ -21,11 +21,15 @@ except ImportError as e:
     print("Please ensure 'config.py' and 'uploader_bot.py' are in the same directory as this script.")
     sys.exit(1)
 
-# --- Configuration ---
-CLIENT_ID_FILE = "client_id.txt"
-BOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bot'))
-USER_DB_PATH = os.path.join(BOT_DIR, 'user_database.json')
-TASK_QUEUE_PATH = os.path.join(BOT_DIR, 'task_queue.json')
+# --- NEW: Centralized Data Directory ---
+# Both the bot and client will now use a shared folder in the user's home directory.
+# This is a much more robust solution than using relative paths.
+DATA_DIR = os.path.join(os.path.expanduser("~"), ".telegram_cloud_service")
+os.makedirs(DATA_DIR, exist_ok=True) # Ensure the directory exists
+
+CLIENT_ID_FILE = os.path.join(DATA_DIR, "client_id.txt")
+USER_DB_PATH = os.path.join(DATA_DIR, 'user_database.json')
+TASK_QUEUE_PATH = os.path.join(DATA_DIR, 'task_queue.json')
 
 
 # --- Helper Functions ---
@@ -73,6 +77,7 @@ def main():
     print("="*40)
     print("  Telegram Cloud Client Daemon")
     print(f"  Client ID: {client_id}")
+    print(f"  Data Directory: {DATA_DIR}")
     print("="*40)
 
     try:
@@ -90,10 +95,10 @@ def main():
     print("Please complete the setup process with the bot on Telegram using the Client ID above.")
     while not my_user_id:
         try:
+            # --- THIS IS THE FIX ---
+            # Added a debug print statement to see exactly what the client is reading.
+            print(f"[DEBUG] Checking for database at: {USER_DB_PATH}")
             user_db = load_json(USER_DB_PATH)
-            # --- NEW DEBUG LINE ---
-            # This will print the contents of the database it's reading every 5 seconds.
-            print(f"Checking database... Found {len(user_db)} user(s). Content: {json.dumps(user_db)}") 
             
             for uid, data in user_db.items():
                 if data.get("client_id") == client_id:
