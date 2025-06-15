@@ -5,36 +5,30 @@ import telebot
 from telebot import types
 import time
 
-# --- This is the fix ---
 # It now correctly imports the token from your config file.
 from config import BOT_TOKEN
 
-# This will be our simple database to store user credentials.
-# It's a JSON file mapping user_id to their credentials.
+# Define paths for our database files
 USER_DB_PATH = "user_database.json"
+TASK_QUEUE_PATH = "task_queue.json"
 
 # A dictionary to keep track of what each user is currently doing (e.g., 'awaiting_token').
 user_states = {}
 
-# --- NEW: In-memory task queue ---
-# This will store commands for the client daemon to pick up.
-# Format: { "user_id": { "task": "upload", "status": "pending" } }
-tasks = {}
-
 # --- Database Helper Functions ---
-def load_user_db():
-    """Loads the user database from the JSON file."""
-    if not os.path.exists(USER_DB_PATH):
+def load_json_db(path):
+    """Safely loads a JSON file."""
+    if not os.path.exists(path):
         return {}
-    with open(USER_DB_PATH, 'r', encoding='utf-8') as f:
+    with open(path, 'r', encoding='utf-8') as f:
         try:
             return json.load(f)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, FileNotFoundError):
             return {}
 
-def save_user_db(data):
-    """Saves the user database to the JSON file."""
-    with open(USER_DB_PATH, 'w', encoding='utf-8') as f:
+def save_json_db(data, path):
+    """Saves data to a JSON file."""
+    with open(path, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=4)
 
 # --- Bot Initialization ---
@@ -42,11 +36,47 @@ bot = telebot.TeleBot(BOT_TOKEN)
 print("Service Bot is running...")
 
 # --- Command Handlers ---
+@bot.message_handler(commands=['reset'])
+def handle_reset(message):
+    """Allows a user to completely reset their data and start over."""
+    user_id = str(message.chat.id)
+    
+    # Clear from in-memory state
+    user_states.pop(user_id, None)
+    
+    # Clear from user database file
+    user_db = load_json_db(USER_DB_PATH)
+    user_data_existed = user_id in user_db
+    if user_data_existed:
+        user_db.pop(user_id, None)
+        save_json_db(user_db, USER_DB_PATH)
+    
+    # Clear from task queue file
+    task_db = load_json_db(TASK_QUEUE_PATH)
+    if user_id in task_db:
+        task_db.pop(user_id, None)
+        save_json_db(task_db, TASK_QUEUE_PATH)
+
+    reset_message = (
+        "Your data has been completely reset on the server.\n\n"
+        "**IMPORTANT NEXT STEP:**\n"
+        "To ensure a clean re-sync, please do the following:\n"
+        "1. Stop the desktop client app if it's running.\n"
+        "2. Go to the `client` folder on your computer.\n"
+        "3. **Delete the `client_id.txt` file.**\n\n"
+        "After you have done this, send /start to begin the setup process again."
+    )
+    if user_data_existed:
+        bot.send_message(user_id, reset_message, parse_mode="Markdown")
+    else:
+        bot.send_message(user_id, "You have no data to reset. Please send /start to begin the setup process.")
+
+
 @bot.message_handler(commands=['start'])
 def handle_start(message):
     """Handles the /start command, beginning the user onboarding process."""
     user_id = str(message.chat.id)
-    user_db = load_user_db()
+    user_db = load_json_db(USER_DB_PATH)
 
     welcome_text = (
         "👋 **Welcome to Telegram Cloud Service!**\n\n"
@@ -55,11 +85,9 @@ def handle_start(message):
     )
     bot.send_message(user_id, welcome_text, parse_mode="Markdown")
 
-    # Check if user is already registered
     if user_id in user_db and "client_id" in user_db[user_id]:
-        bot.send_message(user_id, "It looks like you're already set up! You can now use commands like `/upload` or `/files`.")
+        bot.send_message(user_id, "It looks like you're already set up! You can now use commands like `/upload` or `/files`. If you want to start over, send /reset.")
     else:
-        # Start the setup process
         setup_step1_ask_for_bot(message)
 
 
@@ -67,15 +95,16 @@ def handle_start(message):
 def handle_upload_command(message):
     """Handles the /upload command from a registered user."""
     user_id = str(message.chat.id)
-    user_db = load_user_db()
+    user_db = load_json_db(USER_DB_PATH)
 
-    # Check if the user has completed setup
     if user_id not in user_db or "client_id" not in user_db[user_id]:
         bot.send_message(user_id, "You need to complete the setup process first. Please send /start to begin.")
         return
 
-    # Create an upload task for the client to see
-    tasks[user_id] = {"task": "upload", "status": "pending"}
+    # Load the task queue, add a new task, and save it back to the file.
+    tasks_db = load_json_db(TASK_QUEUE_PATH)
+    tasks_db[user_id] = {"task": "upload", "status": "pending"}
+    save_json_db(tasks_db, TASK_QUEUE_PATH)
     
     bot.send_message(user_id, "OK, I've sent a command to your desktop app. Please use the file window that appears on your computer to select the file you want to upload.")
 
@@ -114,9 +143,9 @@ def handle_token_input(message):
         test_bot.get_me()
         bot.send_message(user_id, "✅ Token is valid! Your bot is reachable.")
         
-        user_db = load_user_db()
+        user_db = load_json_db(USER_DB_PATH)
         user_db[user_id] = {"bot_token": token}
-        save_user_db(user_db)
+        save_json_db(user_db, USER_DB_PATH)
         
         setup_step2_ask_for_channel(message)
 
@@ -152,9 +181,12 @@ def handle_forwarded_message(message):
         channel_id = message.forward_from_chat.id
         bot.send_message(user_id, f"✅ Channel detected! Your Channel ID is `{channel_id}`. I've saved it.", parse_mode="Markdown")
         
-        user_db = load_user_db()
+        user_db = load_json_db(USER_DB_PATH)
+        # Check if the user_id already exists before trying to add a key to it
+        if user_id not in user_db:
+            user_db[user_id] = {}
         user_db[user_id]["channel_id"] = channel_id
-        save_user_db(user_db)
+        save_json_db(user_db, USER_DB_PATH)
         
         setup_step3_ask_for_client_id(message)
     else:
@@ -190,9 +222,11 @@ def handle_client_id_input(message):
 
     bot.send_message(user_id, "✅ Client ID received and saved!")
 
-    user_db = load_user_db()
+    user_db = load_json_db(USER_DB_PATH)
+    if user_id not in user_db:
+            user_db[user_id] = {}
     user_db[user_id]["client_id"] = client_id
-    save_user_db(user_db)
+    save_json_db(user_db, USER_DB_PATH)
 
     setup_complete(message)
 
@@ -206,20 +240,6 @@ def setup_complete(message):
     )
     bot.send_message(user_id, text, parse_mode="Markdown")
     user_states.pop(user_id, None)
-
-
-# --- API Endpoint for Client Daemon ---
-# This is a bit of a "hack" for our console-based version.
-# A real web service would use a proper API.
-# We'll use a custom command that only our bot owner (you) can use to see tasks.
-# This helps us debug. The client will eventually poll an endpoint.
-@bot.message_handler(commands=['get_tasks'])
-def get_tasks_for_client(message):
-    # For now, we just print the tasks to the console where the bot is running.
-    # The client app will eventually fetch this data.
-    print("--- Current Task Queue ---")
-    print(json.dumps(tasks, indent=2))
-    print("--------------------------")
 
 
 # This makes the bot run continuously

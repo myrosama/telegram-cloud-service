@@ -1,30 +1,31 @@
 # client/main.py
 import os
 import sys
-import telebot
 import time
 import uuid
 import json
+
+# Add the script's own directory to the Python path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import telebot
 from tkinter import Tk, filedialog
 
-# This allows the script to find our other project modules
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
 try:
-    # We need the service bot's token to communicate with it.
-    from bot.config import BOT_TOKEN as SERVICE_BOT_TOKEN
-    from client.uploader_bot import perform_upload
-except ImportError:
+    from config import SERVICE_BOT_TOKEN
+    # We rename the import to avoid confusion with the function name
+    from uploader_bot import perform_upload as uploader_function
+except ImportError as e:
     print("---FATAL ERROR---")
-    print("Could not import necessary modules. Ensure bot and client folders are structured correctly.")
+    print(f"Could not import necessary modules: {e}")
+    print("Please ensure 'config.py' and 'uploader_bot.py' are in the same directory as this script.")
     sys.exit(1)
 
 # --- Configuration ---
 CLIENT_ID_FILE = "client_id.txt"
-# This client needs to know where the bot's user database is to find its credentials
-USER_DB_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bot', 'user_database.json'))
-# This is the shared file for communication
-TASK_QUEUE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bot', 'task_queue.json'))
+BOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bot'))
+USER_DB_PATH = os.path.join(BOT_DIR, 'user_database.json')
+TASK_QUEUE_PATH = os.path.join(BOT_DIR, 'task_queue.json')
 
 
 # --- Helper Functions ---
@@ -47,7 +48,7 @@ def load_json(path):
     with open(path, 'r', encoding='utf-8') as f:
         try:
             return json.load(f)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, FileNotFoundError):
             return {}
 
 def save_json(data, path):
@@ -58,8 +59,8 @@ def save_json(data, path):
 def open_file_dialog():
     """Opens a native file dialog for the user to select a file."""
     root = Tk()
-    root.withdraw()  # Hide the main tkinter window
-    root.attributes('-topmost', True) # Bring the dialog to the front
+    root.withdraw()
+    root.attributes('-topmost', True)
     filepath = filedialog.askopenfilename(title="Select a file to upload")
     root.destroy()
     return filepath
@@ -78,28 +79,34 @@ def main():
         service_bot = telebot.TeleBot(SERVICE_BOT_TOKEN)
         service_bot.get_me()
         print("Successfully connected to the main service bot.")
-        print("Waiting for commands... (Checking every 5 seconds)")
-        print("Keep this window open. You can now use /upload on Telegram.")
-        print("(Press Ctrl+C to exit)")
 
     except Exception as e:
         print(f"\n---FATAL CONNECTION ERROR---: {e}")
         return
     
-    # Find the user_id associated with this client
-    user_db = load_json(USER_DB_PATH)
+    # --- Registration Loop ---
     my_user_id = None
-    for uid, data in user_db.items():
-        if data.get("client_id") == client_id:
-            my_user_id = uid
-            break
+    print("Waiting for registration...")
+    print("Please complete the setup process with the bot on Telegram using the Client ID above.")
+    while not my_user_id:
+        try:
+            user_db = load_json(USER_DB_PATH)
+            # --- NEW DEBUG LINE ---
+            # This will print the contents of the database it's reading every 5 seconds.
+            print(f"Checking database... Found {len(user_db)} user(s). Content: {json.dumps(user_db)}") 
+            
+            for uid, data in user_db.items():
+                if data.get("client_id") == client_id:
+                    my_user_id = uid
+                    break
+            if not my_user_id:
+                time.sleep(5)
+        except KeyboardInterrupt:
+            print("\nExiting during registration check.")
+            return
     
-    if not my_user_id:
-        print("\nCould not find a registered user for this Client ID.")
-        print("Please complete the setup process with the bot on Telegram.")
-        return
-
-    print(f"Linked to Telegram User ID: {my_user_id}")
+    print("\n✅ Successfully Linked to Telegram User!")
+    print("Waiting for commands... Keep this window open.")
 
     # The main polling loop
     while True:
@@ -110,31 +117,30 @@ def main():
             if my_task and my_task.get("status") == "pending" and my_task.get("task") == "upload":
                 print("\nReceived 'upload' command from bot.")
                 
-                # Mark task as in-progress
                 my_task["status"] = "processing"
                 save_json(tasks_db, TASK_QUEUE_PATH)
 
-                # Get the user's credentials
-                user_bot_token = user_db[my_user_id].get("bot_token")
-                user_channel_id = user_db[my_user_id].get("channel_id")
+                # We need to re-load the user_db here to get the latest credentials
+                user_db = load_json(USER_DB_PATH) 
+                user_credentials = user_db.get(my_user_id, {})
+                user_bot_token = user_credentials.get("bot_token")
+                user_channel_id = user_credentials.get("channel_id")
 
                 if not user_bot_token or not user_channel_id:
-                    print("Error: Missing user's bot token or channel ID.")
-                    service_bot.send_message(my_user_id, "❌ Upload failed: Your configuration is incomplete.")
+                    print("Error: Missing user's bot token or channel ID in the database.")
+                    service_bot.send_message(my_user_id, "❌ Upload failed: Your configuration is incomplete. Please /reset and start again.")
                 else:
-                    # Open file dialog and perform upload
                     selected_file = open_file_dialog()
                     if selected_file:
                         print(f"User selected file: {selected_file}")
-                        perform_upload(user_bot_token, user_channel_id, selected_file, service_bot, my_user_id)
+                        uploader_function(user_bot_token, user_channel_id, selected_file, service_bot, my_user_id)
                     else:
                         print("User cancelled file selection.")
                         service_bot.send_message(my_user_id, "Upload cancelled because no file was selected.")
                 
-                # Mark task as complete
                 tasks_db.pop(my_user_id, None)
                 save_json(tasks_db, TASK_QUEUE_PATH)
-                print("Task complete. Waiting for next command...")
+                print("\nTask complete. Waiting for next command...")
 
             time.sleep(5) 
         except KeyboardInterrupt:
@@ -142,7 +148,7 @@ def main():
             break
         except Exception as e:
             print(f"An error occurred in the main loop: {e}")
-            time.sleep(15) # Wait longer after an error
+            time.sleep(15)
 
 if __name__ == "__main__":
     main()
