@@ -3,6 +3,7 @@ import os
 import json
 import telebot
 from telebot import types
+import time
 
 # --- This is the fix ---
 # It now correctly imports the token from your config file.
@@ -14,6 +15,11 @@ USER_DB_PATH = "user_database.json"
 
 # A dictionary to keep track of what each user is currently doing (e.g., 'awaiting_token').
 user_states = {}
+
+# --- NEW: In-memory task queue ---
+# This will store commands for the client daemon to pick up.
+# Format: { "user_id": { "task": "upload", "status": "pending" } }
+tasks = {}
 
 # --- Database Helper Functions ---
 def load_user_db():
@@ -56,6 +62,25 @@ def handle_start(message):
         # Start the setup process
         setup_step1_ask_for_bot(message)
 
+
+@bot.message_handler(commands=['upload'])
+def handle_upload_command(message):
+    """Handles the /upload command from a registered user."""
+    user_id = str(message.chat.id)
+    user_db = load_user_db()
+
+    # Check if the user has completed setup
+    if user_id not in user_db or "client_id" not in user_db[user_id]:
+        bot.send_message(user_id, "You need to complete the setup process first. Please send /start to begin.")
+        return
+
+    # Create an upload task for the client to see
+    tasks[user_id] = {"task": "upload", "status": "pending"}
+    
+    bot.send_message(user_id, "OK, I've sent a command to your desktop app. Please use the file window that appears on your computer to select the file you want to upload.")
+
+
+# --- Setup Conversation Handlers ---
 def setup_step1_ask_for_bot(message):
     """Guides the user to create their own bot."""
     user_id = str(message.chat.id)
@@ -69,18 +94,15 @@ def setup_step1_ask_for_bot(message):
         "Once you have your token, please paste it here."
     )
     bot.send_message(user_id, text, parse_mode="Markdown")
-    # Set the user's state so we know they are expected to send a token next
     user_states[user_id] = 'awaiting_token'
 
 
-# --- Message Handlers for Setup ---
 @bot.message_handler(func=lambda message: user_states.get(str(message.chat.id)) == 'awaiting_token')
 def handle_token_input(message):
     """Handles the user pasting their bot token."""
     user_id = str(message.chat.id)
     token = message.text.strip()
 
-    # Basic validation to see if it looks like a token
     if ":" not in token or len(token) < 40:
         bot.send_message(user_id, "That doesn't look like a valid bot token. Please get the correct token from @BotFather and paste it here.")
         return
@@ -88,12 +110,10 @@ def handle_token_input(message):
     bot.send_message(user_id, "✅ Great! Token received. Let's test it...")
 
     try:
-        # Try to connect with the user's token to see if it's valid
         test_bot = telebot.TeleBot(token)
         test_bot.get_me()
         bot.send_message(user_id, "✅ Token is valid! Your bot is reachable.")
         
-        # Save the token and move to the next step
         user_db = load_user_db()
         user_db[user_id] = {"bot_token": token}
         save_user_db(user_db)
@@ -122,7 +142,7 @@ def setup_step2_ask_for_channel(message):
 
 @bot.message_handler(
     func=lambda message: user_states.get(str(message.chat.id)) == 'awaiting_forward',
-    content_types=['text', 'photo', 'document', 'video'] # Listen for any forwarded message
+    content_types=['text', 'photo', 'document', 'video']
 )
 def handle_forwarded_message(message):
     """Handles the user forwarding a message to get the channel ID."""
@@ -132,7 +152,6 @@ def handle_forwarded_message(message):
         channel_id = message.forward_from_chat.id
         bot.send_message(user_id, f"✅ Channel detected! Your Channel ID is `{channel_id}`. I've saved it.", parse_mode="Markdown")
         
-        # Save the channel ID
         user_db = load_user_db()
         user_db[user_id]["channel_id"] = channel_id
         save_user_db(user_db)
@@ -162,7 +181,6 @@ def handle_client_id_input(message):
     user_id = str(message.chat.id)
     client_id = message.text.strip()
 
-    # Basic validation for UUID format
     try:
         import uuid
         uuid.UUID(client_id, version=4)
@@ -187,8 +205,21 @@ def setup_complete(message):
         "You can now use commands like `/upload` to begin storing files. Keep the desktop application running in the background."
     )
     bot.send_message(user_id, text, parse_mode="Markdown")
-    # Clear the user's state
     user_states.pop(user_id, None)
+
+
+# --- API Endpoint for Client Daemon ---
+# This is a bit of a "hack" for our console-based version.
+# A real web service would use a proper API.
+# We'll use a custom command that only our bot owner (you) can use to see tasks.
+# This helps us debug. The client will eventually poll an endpoint.
+@bot.message_handler(commands=['get_tasks'])
+def get_tasks_for_client(message):
+    # For now, we just print the tasks to the console where the bot is running.
+    # The client app will eventually fetch this data.
+    print("--- Current Task Queue ---")
+    print(json.dumps(tasks, indent=2))
+    print("--------------------------")
 
 
 # This makes the bot run continuously
